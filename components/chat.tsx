@@ -12,7 +12,6 @@ export default function Chat({ selectedChat }: any) {
   const [currentChatId, setCurrentChatId] = useState<number | null>(null);
   const [chatTitle, setChatTitle] = useState<string>("New Chat");
 
-  // ✅ FIX: synchronous session init (NO race condition)
   const [sessionId] = useState(() => {
     if (typeof window !== "undefined") {
       let id = localStorage.getItem("session_id");
@@ -88,7 +87,7 @@ export default function Chat({ selectedChat }: any) {
   // ================= SEND MESSAGE =================
   const sendMessage = async (customInput?: string) => {
     const question = customInput || input;
-    if (!question || !sessionId) return; // ✅ SAFE GUARD
+    if (!question || !sessionId) return;
 
     if (messages.length === 0) {
       generateTitle(question);
@@ -105,7 +104,7 @@ export default function Chat({ selectedChat }: any) {
       body: JSON.stringify({
         question,
         history: messages.slice(-6),
-        sessionId, // ✅ SAFE
+        sessionId,
       }),
     });
 
@@ -131,24 +130,26 @@ export default function Chat({ selectedChat }: any) {
       const decoder = new TextDecoder();
 
       let assistantText = "";
+      let buffer = ""; 
 
       while (true) {
         const { done, value } = await reader!.read();
         if (done) break;
 
-        const chunk = decoder.decode(value);
+        buffer += decoder.decode(value);
 
-        // ✅ FOLLOWUPS LOGIC — UNCHANGED
-        if (chunk.includes("__FOLLOWUPS__")) {
-          const [textPart, followPart] = chunk.split("__FOLLOWUPS__");
+        if (buffer.includes("__FOLLOWUPS__")) {
+          const [textPart, followPart] = buffer.split("__FOLLOWUPS__");
 
-          assistantText += textPart;
+          assistantText = textPart;
 
           try {
             setFollowUps(JSON.parse(followPart));
           } catch {}
+
+          buffer = textPart; // prevent reprocessing
         } else {
-          assistantText += chunk;
+          assistantText = buffer;
         }
 
         setMessages((prev) => {

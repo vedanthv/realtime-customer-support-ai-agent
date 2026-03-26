@@ -3,36 +3,12 @@ import { vectorSearch } from "@/lib/databricks";
 import { callLLM } from "@/lib/llm";
 import OpenAI from "openai";
 import redis from "@/lib/redis"; 
+import fs from "fs";
+import path from "path";
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
 });
-
-// ================= ROUTER =================
-
-async function shouldUseSQL(question: string) {
-  const prompt = `
-Classify the query.
-
-Return ONLY one word:
-SQL or RAG
-
-Rules:
-- SQL → aggregations, totals, trends, peak, highest, lowest
-- RAG → explanations, descriptions, specific records
-
-Query:
-${question}
-`;
-
-  const res = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [{ role: "user", content: prompt }],
-  });
-
-  const decision = res.choices[0].message.content?.trim();
-  return decision === "SQL";
-}
 
 // ================= SQL HELPERS =================
 
@@ -53,22 +29,80 @@ function cleanSQL(sql: string) {
 
 const today = new Date().toISOString().split("T")[0];
 
-async function generateSQL(question: string) {
-  const prompt = `
-You are a SQL generator.
-...
-Question: ${question}
-`;
+let cachedPrompt: string | null = null;
 
+function getPromptTemplate(): string {
+  if (!cachedPrompt) {
+    const filePath = path.join(process.cwd(), "prompts", "sql_rag_classifier.txt");
+    cachedPrompt = fs.readFileSync(filePath, "utf-8");
+  }
+  return cachedPrompt;
+}
+
+let lastQueryContext: any = null;
+
+function summarizeContext(rows: any[]) {
+  if (!rows || rows.length === 0) return null;
+
+  const sample = rows.slice(0, 5); // limit size
+  const keys = Object.keys(sample[0]);
+
+  const idFields = keys.filter((k) =>
+    k.toLowerCase().includes("id")
+  );
+
+  const summary: any = {};
+
+  for (const field of idFields) {
+    summary[field] = sample
+      .map((r) => r[field])
+      .filter(Boolean);
+  }
+
+  return summary;
+}
+
+function formatContextForPrompt(context: any) {
+  if (!context) return "";
+
+  let text = "\nPrevious query result context:\n";
+
+  for (const key of Object.keys(context)) {
+    const values = context[key]
+      .map((v: any) => `'${v}'`)
+      .join(", ");
+
+    text += `${key}: ${values}\n`;
+  }
+
+  return text;
+}
+
+async function generateSQL(question: string, history: any[] = []) {
+  const historyText = history
+    .map((m) => `${m.role}: ${m.content}`)
+    .join("\n");
+
+  const template = getPromptTemplate();
+
+  const contextText = formatContextForPrompt(lastQueryContext);
+
+  const prompt = template
+  .replace(/{{history}}/g, historyText + contextText)
+  .replace(/{{today}}/g, today)
+  .replace(/{{question}}/g, question);
+
+  console.log(prompt.substring(0, 500));
   const res = await openai.chat.completions.create({
     model: "gpt-4o-mini",
+    temperature: 0,
     messages: [{ role: "user", content: prompt }],
   });
-
   return cleanSQL(res.choices[0].message.content!);
 }
 
 async function runSQL(query: string) {
+  console.log("Running SQL:", query);
   const res = await fetch(process.env.DATABRICKS_SQL_URL!, {
     method: "POST",
     headers: {
@@ -101,7 +135,16 @@ async function runSQL(query: string) {
 async function generateFollowUps(question: string, answer: string) {
   const prompt = `
 Generate 3 short follow-up responses.
-...
+
+Rules:
+- Max 10 words
+- No numbering
+- No symbols
+
+Dont answer or give followups for general questions.
+
+Question: ${question}
+Answer: ${answer}
 `;
 
   const res = await openai.chat.completions.create({
@@ -121,11 +164,10 @@ Generate 3 short follow-up responses.
 // ================= MAIN =================
 
 export async function POST(req: NextRequest) {
-  const { question, history, sessionId } = await req.json(); // ✅ NEW
+  const { question, history, sessionId } = await req.json(); 
 
   const key = `chat:${sessionId}`;
 
-  // ================= GET REDIS HISTORY =================
   let redisHistory: any[] = [];
 
   try {
@@ -139,7 +181,6 @@ export async function POST(req: NextRequest) {
     ? redisHistory.slice(-6)
     : history || [];
 
-  // ================= STORE USER MESSAGE =================
   if (sessionId) {
     await redis.rpush(
       key,
@@ -149,7 +190,9 @@ export async function POST(req: NextRequest) {
     await redis.expire(key, 3600);
   }
 
-  const useSQL = await shouldUseSQL(question);
+  const sqlOrRag = await generateSQL(question, finalHistory);
+  const useSQL = sqlOrRag.trim() !== "RAG";
+
   console.log("ROUTE:", useSQL ? "SQL" : "RAG");
 
   // ================= SQL ROUTE =================
@@ -157,7 +200,8 @@ export async function POST(req: NextRequest) {
     try {
       const sql = await generateSQL(question);
       const result = await runSQL(sql);
-
+      console.log(result);
+      lastQueryContext = summarizeContext(result);
       if (!result || result.length === 0) {
         const { context } = await vectorSearch(question);
 
@@ -199,7 +243,6 @@ export async function POST(req: NextRequest) {
 
       const followUps = await generateFollowUps(question, summary);
 
-      // ✅ STORE ASSISTANT RESPONSE
       if (sessionId) {
         await redis.rpush(
           key,
