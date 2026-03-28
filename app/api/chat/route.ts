@@ -165,7 +165,18 @@ async function generateSQL(question: string, history: any[] = []) {
     temperature: 0,
     messages: [{ role: "user", content: prompt }],
   });
-  return cleanSQL(res.choices[0].message.content!);
+  
+  const rawContent = res.choices[0].message.content!;
+  
+  // Parse JSON response
+  try {
+    const parsed = JSON.parse(rawContent);
+    return parsed;
+  } catch (e) {
+    console.error("Failed to parse classifier JSON:", rawContent);
+    // Fallback: treat as RAG if JSON parsing fails
+    return { route: "RAG", confidence: 0.5, reasoning: "Parser error", sql: null };
+  }
 }
 
 async function runSQL(query: string) {
@@ -302,45 +313,59 @@ export async function POST(req: NextRequest) {
     await appendHistory(key, "user", question);
   }
 
+  // Step 1: Get classifier decision with confidence score
   const tClassify0 = performance.now();
-  let sqlOrRag = await generateSQL(question, finalHistory);
-  let useSQL = sqlOrRag.trim() !== "RAG";
-  let forcedSql = false;
+  const classificationResult = await generateSQL(question, finalHistory);
   timings.classify_ms = Math.round(performance.now() - tClassify0);
 
-  if (!useSQL && shouldForceSqlAnalytics(question)) {
-    const forcedQuestion = `${question}\n\nThis request is clearly asking for structured time-series analytics. Return SQL only, grouped at the requested time grain.`;
-    const tForcedAnalytics0 = performance.now();
-    sqlOrRag = await generateSQL(forcedQuestion, finalHistory);
-    useSQL = sqlOrRag.trim() !== "RAG";
-    forcedSql = useSQL;
-    timings.forced_analytics_classify_ms = Math.round(performance.now() - tForcedAnalytics0);
+  // Parse the response
+  const {
+    route: classifiedRoute = "RAG",
+    confidence = 0.5,
+    reasoning = "Unknown",
+    sql: classifiedSQL = null
+  } = classificationResult;
+
+  console.log(`Classification: ${classifiedRoute} (confidence: ${confidence}), reasoning: ${reasoning}`);
+
+  // Step 2: Make routing decision based on confidence
+  // High confidence (>= 0.85) → trust the classifier
+  // Low confidence (< 0.85) → use safety net or default to RAG
+  let useSQL = false;
+  let forcedSql = false;
+  let sqlOrRag = "";
+  let finalDecisionReason = reasoning;
+
+  if (confidence >= 0.85) {
+    // Trust high-confidence classification
+    useSQL = classifiedRoute === "SQL";
+    forcedSql = false;
+    sqlOrRag = classifiedSQL || "RAG";
+  } else if (confidence >= 0.70 && classifiedRoute === "SQL") {
+    // Medium confidence SQL → try it, but be prepared to fallback
+    useSQL = true;
+    forcedSql = false;
+    sqlOrRag = classifiedSQL || "RAG";
+  } else {
+    // Low confidence → default to RAG (safe fallback)
+    useSQL = false;
+    forcedSql = false;
+    sqlOrRag = "RAG";
+    finalDecisionReason = `Low confidence (${confidence.toFixed(2)}). Defaulting to RAG. ${reasoning}`;
   }
 
-  if (!useSQL && shouldForceSqlFollowUp(question, lastQueryContext)) {
-    const forcedQuestion = `${question}\n\nThis is a follow-up to previous SQL results. Resolve pronouns like 'this order' using previous context and return SQL only.`;
-    const tForcedClassify0 = performance.now();
-    sqlOrRag = await generateSQL(forcedQuestion, finalHistory);
-    useSQL = sqlOrRag.trim() !== "RAG";
-    forcedSql = useSQL;
-    timings.forced_classify_ms = Math.round(performance.now() - tForcedClassify0);
-  }
-
-  const decisionReason = useSQL
-    ? forcedSql
-      ? "Follow-up referenced prior order context, so SQL mode was forced."
-      : "Question was classified as structured analytics, so SQL mode was selected."
-    : "Question was classified as unstructured retrieval, so RAG mode was selected.";
+  const decisionReason = useSQL ? finalDecisionReason : finalDecisionReason;
 
   console.log("ROUTE:", useSQL ? "SQL" : "RAG");
 
   // ================= SQL ROUTE =================
   if (useSQL) {
     try {
-      const sql = sqlOrRag;
+      const sql = cleanSQL(classifiedSQL || "");
       await logMlflowParams(mlflowRunId, {
         route_mode: "SQL",
         forced_sql: String(forcedSql),
+        classifier_confidence: String(confidence.toFixed(2)),
       });
 
       const tSqlExec0 = performance.now();
@@ -386,6 +411,7 @@ export async function POST(req: NextRequest) {
             followUps: [],
             mode: "RAG",
             reason: "SQL returned no rows; switched to retrieval context.",
+            classifier_confidence: parseFloat(confidence.toFixed(2)),
             context: lastQueryContext,
             requestId,
           }),
@@ -443,6 +469,7 @@ export async function POST(req: NextRequest) {
           followUps,
           mode: "SQL",
           reason: decisionReason,
+          classifier_confidence: parseFloat(confidence.toFixed(2)),
           context: lastQueryContext,
           requestId,
         }),
@@ -521,6 +548,7 @@ export async function POST(req: NextRequest) {
           encoder.encode("\n__META__" + JSON.stringify({
             mode: "RAG",
             reason: decisionReason,
+            classifier_confidence: parseFloat(confidence.toFixed(2)),
             context: lastQueryContext,
             requestId,
           }))
